@@ -41,7 +41,6 @@ jobs:
           --console
           --collect-all rich
           --collect-all certifi
-          --collect-all OpenSSL
           checker.py
 
       - name: Upload artifact (всегда)
