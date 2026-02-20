@@ -36,7 +36,6 @@ jobs:
       - name: Подготовить openssl.exe для упаковки
         shell: pwsh
         run: |
-          # На windows-latest OpenSSL уже установлен — просто находим и копируем
           $candidates = @(
             "C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
             "C:\Program Files\OpenSSL\bin\openssl.exe",
@@ -47,7 +46,6 @@ jobs:
             if (Test-Path $c) { $found = $c; break }
           }
           if (-not $found) {
-            # Ищем через where.exe
             $found = (where.exe openssl 2>$null) | Select-Object -First 1
           }
           if (-not $found) {
@@ -57,19 +55,35 @@ jobs:
           Write-Host "Найден: $found"
           & $found version
           New-Item -ItemType Directory -Force -Path bin | Out-Null
+          $binDir = Split-Path $found -Parent
+          # Копируем openssl.exe
           Copy-Item $found -Destination bin\openssl.exe
-          Write-Host "Скопирован в bin\openssl.exe"
+          # Копируем все DLL из той же папки (libssl, libcrypto и др.)
+          Get-ChildItem "$binDir\*.dll" | ForEach-Object {
+            Write-Host "Копирую DLL: $($_.Name)"
+            Copy-Item $_.FullName -Destination "bin\$($_.Name)"
+          }
+          Write-Host "Готово. Содержимое bin/:"
+          Get-ChildItem bin | Select-Object Name
 
       - name: Build EXE
-        run: >
-          pyinstaller
-          --onefile
-          --name checker
-          --console
-          --collect-all rich
-          --collect-all certifi
-          --add-binary "bin/openssl.exe;bin"
-          checker.py
+        shell: pwsh
+        run: |
+          # Формируем --add-binary для openssl.exe и всех DLL из bin/
+          $binArgs = @()
+          Get-ChildItem bin | ForEach-Object {
+            $binArgs += "--add-binary"
+            $binArgs += "bin\$($_.Name);bin"
+          }
+          $args = @(
+            "--onefile",
+            "--name", "checker",
+            "--console",
+            "--collect-all", "rich",
+            "--collect-all", "certifi"
+          ) + $binArgs + @("checker.py")
+          Write-Host "pyinstaller $args"
+          pyinstaller @args
 
       - name: Upload artifact (всегда)
         uses: actions/upload-artifact@v4
