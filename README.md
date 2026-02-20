@@ -45,6 +45,11 @@ pip install -r requirements.txt
 python checker.py
 ```
 
+> **Для проверки OCSP Stapling** при запуске из исходников нужен `openssl.exe` в папке `bin/`.
+> Скачай [OpenSSL для Windows](https://mirror.firedaemon.com/OpenSSL/openssl-3.3.2.zip),
+> распакуй `openssl.exe` (x64) в папку `bin/` рядом с `checker.py`.
+> В скомпилированном `checker.exe` openssl уже встроен.
+
 ---
 
 ## Пример вывода
