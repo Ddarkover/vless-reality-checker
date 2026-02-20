@@ -184,19 +184,18 @@ def check_redirect(domain: str) -> dict:
 
 def check_ocsp(domain: str) -> dict:
     """
-    Критерий 6: OCSP Stapling через pyOpenSSL + certifi.
-    pyOpenSSL — надёжный способ запросить status_request и получить staple.
+    Критерий 6: OCSP Stapling через pyOpenSSL.
+    Верификация сертификата намеренно отключена — нам важно только наличие
+    OCSP staple в TLS-ответе, а не подлинность сертификата (это уже проверено выше).
     """
     result = {"ok": False, "error": None}
     sock = None
     conn = None
     try:
-        # Создаём контекст pyOpenSSL с CA из certifi
         ctx = OSSLContext(OSSL.TLS_CLIENT_METHOD)
-        ctx.load_verify_locations(cafile=certifi.where())
-        ctx.set_verify(OSSL.VERIFY_PEER, lambda conn, cert, err, depth, ok: ok)
+        # Отключаем верификацию — нужен только staple, не проверка цепочки
+        ctx.set_verify(OSSL.VERIFY_NONE, None)
 
-        # Колбэк для OCSP — принимаем любой ответ, главное что он есть
         ocsp_data_holder = []
 
         def ocsp_callback(conn, ocsp_data, extra):
@@ -209,23 +208,23 @@ def check_ocsp(domain: str) -> dict:
         sock = socket.create_connection((domain, 443), timeout=10)
         conn = OSSLConn(ctx, sock)
         conn.set_tlsext_host_name(domain.encode("ascii"))
-        conn.request_ocsp()        # отправляем status_request в ClientHello
+        conn.request_ocsp()
         conn.set_connect_state()
         conn.do_handshake()
 
-        # Дополнительная проверка через get_tlsext_status_ocsp_resp
         staple = conn.get_tlsext_status_ocsp_resp()
         result["ok"] = bool(staple) or bool(ocsp_data_holder)
 
-    except OSSL.Error as e:
-        msgs = [str(m) for m in e.args[0]] if e.args else []
-        result["error"] = "; ".join(msgs) if msgs else "OpenSSL ошибка"
     except socket.timeout:
         result["error"] = "Таймаут соединения"
     except ConnectionRefusedError:
         result["error"] = "Соединение отклонено"
     except Exception as e:
-        result["error"] = str(e)
+        # Убираем шум от OpenSSL — показываем только человекочитаемое сообщение
+        msg = str(e)
+        if not msg or msg == "[]":
+            msg = "Нет ответа от сервера"
+        result["error"] = msg
     finally:
         if conn:
             try:
@@ -598,15 +597,20 @@ def run_session() -> bool:
 def _ask_repeat() -> bool:
     """Спрашивает пользователя: повторить или выйти. Возвращает True = повторить."""
     console.print()
-    console.print(
-        "[dim]Нажмите [bold white]Enter[/bold white] — проверить новые домены  "
-        "│  [bold white]q + Enter[/bold white] — выход[/dim]"
-    )
-    try:
-        answer = input("  > ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return False
-    return answer not in ("q", "quit", "exit", "выход")
+    console.rule("[dim]Что дальше?[/dim]")
+    console.print("  [bold cyan]1[/bold cyan]  — Проверить новые домены")
+    console.print("  [bold cyan]2[/bold cyan]  — Выход")
+    console.print()
+    while True:
+        try:
+            answer = input("  Выбор [1/2]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if answer == "1":
+            return True
+        if answer in ("2", "q", "quit", "exit", "выход", ""):
+            return False
+        console.print("  [yellow]Введите 1 или 2[/yellow]")
 
 
 # ──────────────────────────────────────────────
