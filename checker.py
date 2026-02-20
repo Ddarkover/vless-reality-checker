@@ -7,8 +7,6 @@ VLESS+Reality Camouflage Site Checker
 import sys
 import ssl
 import socket
-import struct
-import os
 import math
 import ipaddress
 from urllib.parse import urlparse
@@ -20,8 +18,11 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 from rich import box
+from OpenSSL import SSL as OSSL
+from OpenSSL.SSL import Context as OSSLContext, Connection as OSSLConn, TLSv1_2_METHOD
 
 console = Console()
+
 
 # ──────────────────────────────────────────────
 # Утилиты
@@ -55,28 +56,26 @@ def resolve_ip(domain: str) -> str | None:
 
 
 def strip_www(host: str) -> str:
-    """Убирает www. префикс для сравнения."""
     return host.lower().removeprefix("www.")
 
 
 def compare_hosts(origin: str, final: str) -> tuple[bool, bool]:
     """
-    Сравнивает два hostname.
-    Возвращает (exact_match, www_variant):
-      exact_match=True  — домены совпадают точно
-      www_variant=True  — отличаются только www. префиксом
+    Возвращает (exact_match, www_only_diff).
+    exact_match   — hostname совпадает точно.
+    www_only_diff — отличие только в наличии/отсутствии www.
     """
     o = origin.lower().split(":")[0]
     f = final.lower().split(":")[0]
-    exact = (o == f)
-    www_v = (not exact) and (strip_www(o) == strip_www(f))
-    return exact, www_v
+    exact    = (o == f)
+    www_diff = (not exact) and (strip_www(o) == strip_www(f))
+    return exact, www_diff
 
 
 def make_ssl_context() -> ssl.SSLContext:
     """
-    Создаёт SSLContext с сертификатами certifi.
-    Решает CERTIFICATE_VERIFY_FAILED в PyInstaller на Windows.
+    SSLContext с сертификатами certifi.
+    Решает CERTIFICATE_VERIFY_FAILED в PyInstaller-сборке на Windows.
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -148,22 +147,17 @@ def check_redirect(domain: str) -> dict:
     Критерий 3: Главная страница без редиректа на другой домен.
 
     status:
-      "ok"      — hostname совпадает точно, код 2xx         → ✅
-      "warning" — отличие только в www. префиксе            → ⚠️
-      "fail"    — смена домена или ошибка соединения        → ❌
+      "ok"      — hostname совпадает точно, код 2xx                → ✅
+      "warning" — отличие только www. ↔ без www., код 2xx          → ⚠️
+      "fail"    — смена домена, код 4xx/5xx или ошибка соединения  → ❌
     """
     result = {
-        "status": "fail",
-        "status_code": None,
-        "final_url": None,
-        "redirect_chain": [],
-        "www_redirect": False,
-        "error": None,
+        "status": "fail", "status_code": None,
+        "final_url": None, "www_redirect": False, "error": None,
     }
     try:
         with httpx.Client(
-            http2=True,
-            timeout=15,
+            http2=True, timeout=15,
             follow_redirects=True,
             verify=certifi.where(),
         ) as client:
@@ -172,18 +166,12 @@ def check_redirect(domain: str) -> dict:
         result["status_code"] = r.status_code
         result["final_url"]   = str(r.url)
 
-        chain = [f"https://{domain}/"]
-        for hist in r.history:
-            chain.append(str(hist.url))
-        chain.append(str(r.url))
-        result["redirect_chain"] = chain
-
-        final_host  = urlparse(str(r.url)).netloc
-        exact, www_v = compare_hosts(domain, final_host)
+        final_host      = urlparse(str(r.url)).netloc
+        exact, www_diff = compare_hosts(domain, final_host)
 
         if exact and r.status_code < 400:
             result["status"] = "ok"
-        elif www_v and r.status_code < 400:
+        elif www_diff and r.status_code < 400:
             result["status"]       = "warning"
             result["www_redirect"] = True
         else:
@@ -196,179 +184,64 @@ def check_redirect(domain: str) -> dict:
 
 def check_ocsp(domain: str) -> dict:
     """
-    Критерий 6: OCSP Stapling.
-
-    Метод: делаем полноценный TLS-handshake через ssl с расширением
-    status_request. После handshake читаем сырой буфер соединения и
-    ищем TLS-запись типа CertificateStatus (handshake msg type = 22).
-
-    Почему не pyOpenSSL: ненадёжен на Windows в PyInstaller-сборке.
-    Почему не сырой ClientHello: сервер вправе игнорировать
-    незавершённый handshake и не присылать CertificateStatus.
-    Полноценный handshake через ssl + перехват ServerHello-записей
-    через BIO-callback — самый надёжный способ без сторонних библиотек.
+    Критерий 6: OCSP Stapling через pyOpenSSL + certifi.
+    pyOpenSSL — надёжный способ запросить status_request и получить staple.
     """
     result = {"ok": False, "error": None}
-
-    # --- Строим ClientHello вручную с расширением status_request ---
-    # и шлём его сырым сокетом, затем читаем ответ до конца handshake.
-
+    sock = None
+    conn = None
     try:
-        raw_sock = socket.create_connection((domain, 443), timeout=10)
-    except Exception as e:
-        result["error"] = str(e)
-        return result
+        # Создаём контекст pyOpenSSL с CA из certifi
+        ctx = OSSLContext(OSSL.TLS_CLIENT_METHOD)
+        ctx.load_verify_locations(cafile=certifi.where())
+        ctx.set_verify(OSSL.VERIFY_PEER, lambda conn, cert, err, depth, ok: ok)
 
-    try:
-        # ClientHello с расширением status_request (OCSP)
-        client_hello = _build_client_hello_with_ocsp(domain)
-        raw_sock.sendall(client_hello)
+        # Колбэк для OCSP — принимаем любой ответ, главное что он есть
+        ocsp_data_holder = []
 
-        # Читаем ответ сервера — нам нужны записи до CertificateStatus
-        # или до тех пор пока не получим ServerHelloDone / EncryptedExtensions
-        buf = _recv_tls_records(raw_sock, timeout=8, max_bytes=65536)
-        result["ok"] = _has_certificate_status(buf)
+        def ocsp_callback(conn, ocsp_data, extra):
+            if ocsp_data:
+                ocsp_data_holder.append(ocsp_data)
+            return True
 
+        ctx.set_ocsp_client_callback(ocsp_callback, data=None)
+
+        sock = socket.create_connection((domain, 443), timeout=10)
+        conn = OSSLConn(ctx, sock)
+        conn.set_tlsext_host_name(domain.encode("ascii"))
+        conn.request_ocsp()        # отправляем status_request в ClientHello
+        conn.set_connect_state()
+        conn.do_handshake()
+
+        # Дополнительная проверка через get_tlsext_status_ocsp_resp
+        staple = conn.get_tlsext_status_ocsp_resp()
+        result["ok"] = bool(staple) or bool(ocsp_data_holder)
+
+    except OSSL.Error as e:
+        msgs = [str(m) for m in e.args[0]] if e.args else []
+        result["error"] = "; ".join(msgs) if msgs else "OpenSSL ошибка"
     except socket.timeout:
-        result["error"] = "Таймаут"
+        result["error"] = "Таймаут соединения"
+    except ConnectionRefusedError:
+        result["error"] = "Соединение отклонено"
     except Exception as e:
         result["error"] = str(e)
     finally:
-        try:
-            raw_sock.close()
-        except Exception:
-            pass
-
+        if conn:
+            try:
+                conn.shutdown()
+            except Exception:
+                pass
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
     return result
 
 
-def _build_client_hello_with_ocsp(domain: str) -> bytes:
-    """
-    Строит минимальный TLS ClientHello с расширением status_request.
-    Поддерживает TLS 1.2 / 1.3, SNI, ALPN h2.
-    """
-    random_bytes = os.urandom(32)
-    session_id   = b""
-
-    # Cipher suites
-    ciphers = b"".join([
-        b"\x13\x01",  # TLS_AES_128_GCM_SHA256        (TLS 1.3)
-        b"\x13\x02",  # TLS_AES_256_GCM_SHA384        (TLS 1.3)
-        b"\x13\x03",  # TLS_CHACHA20_POLY1305_SHA256   (TLS 1.3)
-        b"\xc0\x2b",  # TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-        b"\xc0\x2f",  # TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-        b"\xc0\x2c",  # TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-        b"\xc0\x30",  # TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-    ])
-
-    def ext(typ: int, body: bytes) -> bytes:
-        return struct.pack(">HH", typ, len(body)) + body
-
-    sni_name = domain.encode()
-    sni_body = struct.pack(">H", len(sni_name) + 3) + b"\x00" + struct.pack(">H", len(sni_name)) + sni_name
-    e_sni    = ext(0x0000, sni_body)                                  # server_name
-
-    e_ocsp   = ext(0x0012, b"\x01\x00\x00\x00\x00")                  # status_request
-
-    groups   = b"\x00\x1d\x00\x17\x00\x18"                           # x25519, secp256r1, secp384r1
-    e_groups = ext(0x000a, struct.pack(">H", len(groups)) + groups)   # supported_groups
-
-    e_ecpf   = ext(0x000b, b"\x01\x00")                              # ec_point_formats
-
-    alpn_val = b"\x00\x02h2"
-    e_alpn   = ext(0x0010, struct.pack(">H", len(alpn_val)) + alpn_val)  # ALPN
-
-    sig_algs = b"\x04\x01\x05\x01\x06\x01\x08\x04\x08\x05\x08\x06\x04\x03\x05\x03\x06\x03"
-    e_sig    = ext(0x000d, struct.pack(">H", len(sig_algs)) + sig_algs)  # signature_algorithms
-
-    e_ver    = ext(0x002b, b"\x02\x03\x04")                           # supported_versions: TLS 1.3
-
-    key_share_x25519 = os.urandom(32)
-    ks_entry = b"\x00\x1d" + struct.pack(">H", len(key_share_x25519)) + key_share_x25519
-    e_ks     = ext(0x0033, struct.pack(">H", len(ks_entry)) + ks_entry)  # key_share
-
-    extensions = e_sni + e_ocsp + e_groups + e_ecpf + e_alpn + e_sig + e_ver + e_ks
-
-    hello_body = (
-        b"\x03\x03"                                          # legacy version TLS 1.2
-        + random_bytes
-        + struct.pack(">B", len(session_id)) + session_id
-        + struct.pack(">H", len(ciphers)) + ciphers
-        + b"\x01\x00"                                        # compression: none
-        + struct.pack(">H", len(extensions)) + extensions
-    )
-
-    # Handshake record: type=1 (ClientHello)
-    hs = b"\x01" + struct.pack(">I", len(hello_body))[1:] + hello_body
-    # TLS record: type=22, version=TLS 1.0 (0x0301)
-    return b"\x16\x03\x01" + struct.pack(">H", len(hs)) + hs
-
-
-def _recv_tls_records(sock: socket.socket, timeout: float, max_bytes: int) -> bytes:
-    """Читает TLS-записи из сокета до таймаута или лимита байт."""
-    sock.settimeout(timeout)
-    buf = b""
-    try:
-        while len(buf) < max_bytes:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-            # Останавливаемся если видим ServerHelloDone (TLS 1.2: 0x0e)
-            # или первую зашифрованную запись (TLS 1.3: ApplicationData type=23 = 0x17)
-            if _is_handshake_complete(buf):
-                break
-    except socket.timeout:
-        pass
-    return buf
-
-
-def _is_handshake_complete(buf: bytes) -> bool:
-    """
-    Возвращает True если в буфере уже есть сигнал конца handshake:
-    - TLS 1.2: ServerHelloDone (handshake type 14 = 0x0e)
-    - TLS 1.3: первая зашифрованная запись (ChangeCipherSpec + ApplicationData)
-    """
-    offset = 0
-    found_ccs = False
-    while offset + 5 <= len(buf):
-        rec_type = buf[offset]
-        length   = struct.unpack(">H", buf[offset + 3:offset + 5])[0]
-        payload  = buf[offset + 5: offset + 5 + length]
-
-        if rec_type == 20:  # ChangeCipherSpec
-            found_ccs = True
-        if rec_type == 23 and found_ccs:  # ApplicationData после CCS → TLS 1.3 encrypted
-            return True
-        if rec_type == 22 and payload and payload[0] == 14:  # ServerHelloDone (TLS 1.2)
-            return True
-
-        offset += 5 + length
-    return False
-
-
-def _has_certificate_status(buf: bytes) -> bool:
-    """
-    Ищет в потоке TLS-записей сообщение CertificateStatus (handshake type = 22 = 0x16).
-    Возвращает True если staple присутствует.
-    """
-    offset = 0
-    while offset + 5 <= len(buf):
-        rec_type = buf[offset]
-        length   = struct.unpack(">H", buf[offset + 3:offset + 5])[0]
-        payload_start = offset + 5
-        payload_end   = payload_start + length
-
-        if payload_end > len(buf):
-            break
-
-        if rec_type == 22 and length > 0:           # Handshake record
-            msg_type = buf[payload_start]
-            if msg_type == 22:                       # CertificateStatus
-                return True
-
-        offset = payload_end
-    return False
+def check_distance(site_lat, site_lon, server_ip: str) -> dict:
+    """Критерий 4: Географическое расстояние между сайтом и сервером."""
     result = {
         "ok": False, "distance_km": None,
         "server_country": "?", "server_city": "?", "error": None,
@@ -379,7 +252,7 @@ def _has_certificate_status(buf: bytes) -> bool:
 
     geo = check_geoip(server_ip)
     if geo["error"] or geo["lat"] is None:
-        result["error"] = geo.get("error", "Нет GeoIP-данных для сервера")
+        result["error"] = geo.get("error", "Нет данных GeoIP для сервера")
         return result
 
     km = haversine_km(site_lat, site_lon, geo["lat"], geo["lon"])
@@ -397,16 +270,17 @@ def _has_certificate_status(buf: bytes) -> bool:
 # ──────────────────────────────────────────────
 
 def check_domain(domain: str, server_ip: str | None) -> dict:
-    results = {}
+    results = {"domain": domain}
 
     with console.status(f"[dim]DNS резолв {domain}...[/dim]"):
         ip = resolve_ip(domain)
 
     if not ip:
-        return {"domain": domain, "ip": None, "fatal": "Не удалось резолвить домен"}
+        results["ip"]    = None
+        results["fatal"] = "Не удалось резолвить домен"
+        return results
 
-    results["domain"] = domain
-    results["ip"]     = ip
+    results["ip"] = ip
 
     with console.status(f"[dim]GeoIP {ip}...[/dim]"):
         results["geo"] = check_geoip(ip)
@@ -417,7 +291,7 @@ def check_domain(domain: str, server_ip: str | None) -> dict:
     with console.status(f"[dim]HTTP запрос {domain}...[/dim]"):
         results["redirect"] = check_redirect(domain)
 
-    with console.status(f"[dim]OCSP Stapling {domain}...[/dim]"):
+    with console.status(f"[dim]OCSP stapling {domain}...[/dim]"):
         results["ocsp"] = check_ocsp(domain)
 
     if server_ip:
@@ -440,8 +314,14 @@ def check_domain(domain: str, server_ip: str | None) -> dict:
 def ok_icon(ok: bool) -> str:
     return "[bold green]✅[/bold green]" if ok else "[bold red]❌[/bold red]"
 
+
 def warn_icon() -> str:
     return "[bold yellow]⚠️ [/bold yellow]"
+
+
+def _redir_score(redir: dict) -> float:
+    """0.0 / 0.5 / 1.0 для fail / warning / ok."""
+    return {"ok": 1.0, "warning": 0.5, "fail": 0.0}.get(redir.get("status", "fail"), 0.0)
 
 
 def render_results(data: dict):
@@ -459,102 +339,99 @@ def render_results(data: dict):
     geo   = data["geo"]
     tls   = data["tls"]
     redir = data["redirect"]
-    ocsp  = data.get("ocsp", {"ok": False, "error": "нет данных"})
+    ocsp  = data["ocsp"]
     dist  = data.get("distance")
 
-    redir_ok   = redir["status"] == "ok"
-    redir_warn = redir["status"] == "warning"
-
-    score_checks = [
-        geo["ok"], tls["tls13"], tls["http2"],
-        redir_ok,
-        tls["encrypted_handshake"],
-        ocsp["ok"],
+    # ── Подсчёт баллов ──
+    scores = [
+        float(geo["ok"]),
+        float(tls["tls13"]),
+        float(tls["http2"]),
+        _redir_score(redir),
+        float(tls["encrypted_handshake"]),
+        float(ocsp["ok"]),
     ]
     if dist is not None:
-        score_checks.append(dist["ok"])
+        scores.append(1.0 if dist.get("ok") else 0.0)
 
-    passed = sum(score_checks)
-    total  = len(score_checks)
-    passed_display = f"{passed}.5/{total}" if redir_warn else f"{passed}/{total}"
-
+    total      = len(scores)
+    passed     = sum(scores)
+    passed_str = f"{int(passed)}" if passed == int(passed) else f"{passed:.1f}"
     score_color = (
-        "green"  if passed == total and not redir_warn else
-        "yellow" if passed >= total - 2 else
+        "green"  if passed == total else
+        "yellow" if passed >= total - 1.5 else
         "red"
     )
     title = (
         f"[bold]{domain}[/bold]  [dim]({ip})[/dim]  "
-        f"[{score_color}]{passed_display} ✅[/{score_color}]"
+        f"[{score_color}]{passed_str}/{total} ✅[/{score_color}]"
     )
 
     table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
     table.add_column("icon",     width=4)
-    table.add_column("критерий", style="bold")
+    table.add_column("критерий", style="bold", min_width=34)
     table.add_column("детали",   style="dim")
 
-    # [1] Сервер вне РФ
-    geo_detail = f"{geo['country']} ({geo['country_code']}), {geo['city']}  |  {geo['org']}"
-    if geo["error"]:
-        geo_detail = f"[red]Ошибка: {geo['error']}[/red]"
+    # [1] Вне РФ
+    geo_detail = (
+        f"{geo['country']} ({geo['country_code']}), {geo['city']}  |  {geo['org']}"
+        if not geo["error"] else f"[red]Ошибка: {geo['error']}[/red]"
+    )
     table.add_row(ok_icon(geo["ok"]), "[1] Сервер вне РФ", geo_detail)
 
-    # [2] TLS 1.3
-    tls_detail = tls["tls_version"] or (
-        f"[red]Ошибка: {tls['error']}[/red]" if tls["error"] else "нет данных"
+    # [2a] TLS 1.3
+    tls_detail = (
+        tls["tls_version"] if tls["tls_version"]
+        else (f"[red]Ошибка: {tls['error']}[/red]" if tls["error"] else "нет данных")
     )
     table.add_row(ok_icon(tls["tls13"]), "[2] TLS 1.3", tls_detail)
 
-    # [2] HTTP/2
-    h2_detail = f"ALPN: {tls['alpn'] or 'нет'}"
-    if tls["error"] and not tls["tls_version"]:
-        h2_detail = f"[red]Ошибка: {tls['error']}[/red]"
+    # [2b] HTTP/2
+    h2_detail = (
+        f"[red]Ошибка: {tls['error']}[/red]"
+        if (tls["error"] and not tls["tls_version"])
+        else f"ALPN: {tls['alpn'] or 'нет'}"
+    )
     table.add_row(ok_icon(tls["http2"]), "[2] HTTP/2", h2_detail)
 
     # [3] Редирект
     if redir["error"]:
-        row_icon     = ok_icon(False)
-        redir_detail = f"[red]Ошибка: {redir['error']}[/red]"
+        r_icon   = ok_icon(False)
+        r_detail = f"[red]Ошибка: {redir['error']}[/red]"
     elif redir["status"] == "ok":
-        row_icon     = ok_icon(True)
-        redir_detail = f"HTTP {redir['status_code']}  →  {redir['final_url']}"
+        r_icon   = ok_icon(True)
+        r_detail = f"HTTP {redir['status_code']}  →  {redir['final_url']}"
     elif redir["status"] == "warning":
-        row_icon     = warn_icon()
-        redir_detail = (
+        r_icon   = warn_icon()
+        r_detail = (
             f"HTTP {redir['status_code']}  →  {redir['final_url']}  "
             f"[yellow](www ↔ без www — допустимо, но нежелательно)[/yellow]"
         )
     else:
-        row_icon     = ok_icon(False)
-        redir_detail = (
-            f"HTTP {redir['status_code']}  →  {redir['final_url']}  "
-            f"[red](смена домена!)[/red]"
-            if redir["final_url"] else "[red]Нет ответа[/red]"
+        r_icon   = ok_icon(False)
+        r_detail = (
+            f"HTTP {redir['status_code']}  →  {redir['final_url']}  [red](смена домена!)[/red]"
+            if redir.get("final_url") else "[red]Нет ответа[/red]"
         )
-    table.add_row(row_icon, "[3] Нет редиректа на другой домен", redir_detail)
+    table.add_row(r_icon, "[3] Нет редиректа на другой домен", r_detail)
 
     # [4] Расстояние
     if dist is None:
         table.add_row("[dim]⏭️ [/dim]", "[4] Расстояние до сервера", "[dim]пропущено[/dim]")
-    elif dist["error"]:
+    elif dist.get("error"):
         table.add_row(
             ok_icon(False), "[4] Расстояние до сервера",
             f"[red]Ошибка: {dist['error']}[/red]",
         )
     else:
-        km = dist["distance_km"]
-        dist_detail = (
-            f"{km} км  "
+        km      = dist["distance_km"]
+        color   = "green" if km < 1000 else ("yellow" if km < 3000 else "red")
+        d_detail = (
+            f"[{color}]{km} км  "
             f"(сайт: {geo['city']}, {geo['country_code']}  →  "
-            f"сервер: {dist['server_city']}, {dist['server_country']})"
+            f"сервер: {dist['server_city']}, {dist['server_country']})[/{color}]"
         )
-        if km < 1000:
-            dist_detail = f"[green]{dist_detail}[/green]"
-        elif km < 3000:
-            dist_detail = f"[yellow]{dist_detail}[/yellow]"
-        else:
-            dist_detail = f"[red]{dist_detail}[/red]"
-        table.add_row(ok_icon(dist["ok"]), "[4] Расстояние до сервера", dist_detail)
+        table.add_row(ok_icon(dist["ok"]), "[4] Расстояние до сервера", d_detail)
 
     # [5] Шифрование после Server Hello
     enc_detail = (
@@ -569,10 +446,12 @@ def render_results(data: dict):
 
     # [6] OCSP Stapling
     if ocsp.get("error"):
+        ocsp_icon   = ok_icon(False)
         ocsp_detail = f"[red]Ошибка: {ocsp['error']}[/red]"
     else:
+        ocsp_icon   = ok_icon(ocsp["ok"])
         ocsp_detail = "Stapling активен" if ocsp["ok"] else "Не поддерживается"
-    table.add_row(ok_icon(ocsp["ok"]), "[6] OCSP Stapling", ocsp_detail)
+    table.add_row(ocsp_icon, "[6] OCSP Stapling", ocsp_detail)
 
     console.print(Panel(table, title=title, border_style=score_color, padding=(0, 1)))
 
@@ -584,19 +463,16 @@ def render_results(data: dict):
 def render_summary(all_results: list[dict]):
     console.rule("[bold]Итоговая сводка[/bold]")
     summary = Table(box=box.ROUNDED, show_header=True, border_style="cyan")
-    summary.add_column("Домен",         style="bold")
+    summary.add_column("Домен",       style="bold")
     summary.add_column("IP")
-    summary.add_column("[1]\nвне РФ",   justify="center")
-    summary.add_column("[2]\nTLS 1.3",  justify="center")
-    summary.add_column("[2]\nHTTP/2",   justify="center")
-    summary.add_column("[3]\nРедирект", justify="center")
-    summary.add_column("[4]\nРасст.",   justify="center")
-    summary.add_column("[5]\nШифр.",    justify="center")
-    summary.add_column("[6]\nOCSP",     justify="center")
-    summary.add_column("Итог",          justify="center")
-
-    def icon(ok: bool) -> str:
-        return "✅" if ok else "❌"
+    summary.add_column("[1]\nвне РФ",  justify="center")
+    summary.add_column("[2]\nTLS 1.3", justify="center")
+    summary.add_column("[2]\nHTTP/2",  justify="center")
+    summary.add_column("[3]\nРедирект",justify="center")
+    summary.add_column("[4]\nРасст.",  justify="center")
+    summary.add_column("[5]\nШифр.",   justify="center")
+    summary.add_column("[6]\nOCSP",    justify="center")
+    summary.add_column("Итог",         justify="center")
 
     for d in all_results:
         if d.get("fatal"):
@@ -606,42 +482,32 @@ def render_summary(all_results: list[dict]):
         geo   = d["geo"]
         tls   = d["tls"]
         redir = d["redirect"]
-        ocsp  = d.get("ocsp", {"ok": False})
+        ocsp  = d["ocsp"]
         dist  = d.get("distance")
 
-        redir_ok   = redir["status"] == "ok"
-        redir_warn = redir["status"] == "warning"
-        redir_cell = "✅" if redir_ok else ("⚠️" if redir_warn else "❌")
-        dist_cell  = "⏭️" if dist is None else icon(dist.get("ok", False))
+        def _i(ok): return "✅" if ok else "❌"
 
-        score_list = [
-            geo["ok"], tls["tls13"], tls["http2"],
-            redir_ok, tls["encrypted_handshake"], ocsp["ok"],
+        redir_cell = {"ok": "✅", "warning": "⚠️", "fail": "❌"}.get(redir.get("status", "fail"), "❌")
+        dist_cell  = "⏭️" if dist is None else _i(dist.get("ok", False))
+
+        scores = [
+            float(geo["ok"]), float(tls["tls13"]), float(tls["http2"]),
+            _redir_score(redir), float(tls["encrypted_handshake"]), float(ocsp["ok"]),
         ]
-        if dist and not dist.get("error"):
-            score_list.append(dist["ok"])
-
-        passed = sum(score_list)
-        total  = len(score_list)
-        passed_display = f"{passed}.5/{total}" if redir_warn else f"{passed}/{total}"
-        color = (
-            "green"  if passed == total and not redir_warn else
-            "yellow" if passed >= total - 2 else
-            "red"
-        )
+        if dist is not None:
+            scores.append(1.0 if dist.get("ok") else 0.0)
+        total  = len(scores)
+        passed = sum(scores)
+        passed_str = f"{int(passed)}" if passed == int(passed) else f"{passed:.1f}"
+        color  = "green" if passed == total else ("yellow" if passed >= total - 1.5 else "red")
 
         summary.add_row(
             d["domain"], d.get("ip", "?"),
-            icon(geo["ok"]),
-            icon(tls["tls13"]),
-            icon(tls["http2"]),
-            redir_cell,
-            dist_cell,
-            icon(tls["encrypted_handshake"]),
-            icon(ocsp["ok"]),
-            f"[{color}]{passed_display}[/{color}]",
+            _i(geo["ok"]), _i(tls["tls13"]), _i(tls["http2"]),
+            redir_cell, dist_cell,
+            _i(tls["encrypted_handshake"]), _i(ocsp["ok"]),
+            f"[{color}]{passed_str}/{total}[/{color}]",
         )
-
     console.print(summary)
 
 
@@ -650,9 +516,10 @@ def render_summary(all_results: list[dict]):
 # ──────────────────────────────────────────────
 
 def get_domains_from_input() -> list[str]:
+    """Интерактивный ввод доменов."""
     console.print(
         "\n[bold]Введите домены для проверки[/bold] "
-        "[dim](по одному, пустая строка — начать проверку):[/dim]"
+        "[dim](по одному, пустая строка — завершить ввод):[/dim]"
     )
     domains = []
     while True:
@@ -667,6 +534,7 @@ def get_domains_from_input() -> list[str]:
 
 
 def get_server_ip() -> str | None:
+    """Запрашивает IP сервера пользователя."""
     console.print(
         "\n[bold]IP-адрес вашего VPN-сервера[/bold] "
         "[dim](Enter — пропустить критерий 4):[/dim]"
@@ -682,28 +550,31 @@ def get_server_ip() -> str | None:
         return raw
     except ValueError:
         console.print(
-            f"[yellow]⚠  «{raw}» — не валидный IP-адрес, критерий 4 пропущен.[/yellow]"
+            f"[yellow]⚠  «{raw}» не является валидным IP-адресом, "
+            f"критерий 4 пропущен.[/yellow]"
         )
         return None
 
 
-# ──────────────────────────────────────────────
-# Главный цикл
-# ──────────────────────────────────────────────
-
-def run_checks(first_run: bool = True):
-    """Один полный цикл ввода и проверки."""
-    if first_run and len(sys.argv) > 1:
-        domains = [normalize_domain(d) for d in sys.argv[1:]]
+def run_session() -> bool:
+    """
+    Один цикл ввода доменов → проверки → вывода.
+    Возвращает True если пользователь хочет повторить, False — выход.
+    """
+    # Домены: из аргументов CLI (только первый запуск) или интерактивно
+    if len(sys.argv) > 1:
+        domains   = [normalize_domain(d) for d in sys.argv[1:]]
+        server_ip = get_server_ip()
+        # После первого запуска сбрасываем argv чтобы следующий цикл был интерактивным
+        sys.argv = sys.argv[:1]
     else:
-        raw = get_domains_from_input()
-        domains = [normalize_domain(d) for d in raw]
+        raw_domains = get_domains_from_input()
+        domains     = [normalize_domain(d) for d in raw_domains]
+        if not domains:
+            console.print("[yellow]Домены не введены.[/yellow]")
+            return _ask_repeat()
+        server_ip = get_server_ip()
 
-    if not domains:
-        console.print("[yellow]Не указано ни одного домена.[/yellow]")
-        return
-
-    server_ip = get_server_ip()
     if server_ip:
         console.print(f"[dim]Сервер: {server_ip}[/dim]")
     else:
@@ -721,6 +592,26 @@ def run_checks(first_run: bool = True):
     if len(all_results) > 1:
         render_summary(all_results)
 
+    return _ask_repeat()
+
+
+def _ask_repeat() -> bool:
+    """Спрашивает пользователя: повторить или выйти. Возвращает True = повторить."""
+    console.print()
+    console.print(
+        "[dim]Нажмите [bold white]Enter[/bold white] — проверить новые домены  "
+        "│  [bold white]q + Enter[/bold white] — выход[/dim]"
+    )
+    try:
+        answer = input("  > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer not in ("q", "quit", "exit", "выход")
+
+
+# ──────────────────────────────────────────────
+# Точка входа
+# ──────────────────────────────────────────────
 
 def main():
     console.print(Panel(
@@ -730,31 +621,14 @@ def main():
         padding=(1, 4),
     ))
 
-    first_run = True
     while True:
-        run_checks(first_run=first_run)
-        first_run = False
-
-        # ── Меню после завершения ──
+        repeat = run_session()
+        if not repeat:
+            break
         console.print()
-        console.rule("[dim]Проверка завершена[/dim]")
-        console.print(
-            "\n"
-            "  [bold cyan][1][/bold cyan]  Проверить новые домены\n"
-            "  [bold cyan][2][/bold cyan]  Выход\n"
-        )
-        try:
-            choice = input("  Ваш выбор (1/2): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
+        console.rule("[dim]Новая проверка[/dim]")
 
-        if choice == "1":
-            console.print()
-            continue
-        else:
-            break
-
-    console.print("\n[dim]До свидания![/dim]\n")
+    console.print("\n[dim]До свидания![/dim]")
 
 
 if __name__ == "__main__":
