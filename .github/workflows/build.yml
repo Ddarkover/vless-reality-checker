@@ -40,6 +40,7 @@ jobs:
           --name checker
           --console
           --collect-all rich
+          --collect-all certifi
           checker.py
 
       - name: Upload artifact (всегда)
