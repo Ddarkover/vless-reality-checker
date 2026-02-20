@@ -4,7 +4,15 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:  # позволяет запустить вручную из GitHub UI
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия релиза (например: v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write  # обязательно для создания Release
 
 jobs:
   build:
@@ -34,15 +42,40 @@ jobs:
           --collect-all rich
           checker.py
 
-      - name: Upload artifact
+      - name: Upload artifact (всегда)
         uses: actions/upload-artifact@v4
         with:
           name: checker-windows-exe
           path: dist/checker.exe
 
-      - name: Attach EXE to GitHub Release
+      # Определяем имя тега: либо из git-тега, либо из ввода workflow_dispatch
+      - name: Определить версию
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Создать GitHub Release и прикрепить EXE
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Release ${{ steps.version.outputs.tag }}"
+          draft: false
+          prerelease: false
           files: dist/checker.exe
+          body: |
+            ## VLESS+Reality Camouflage Site Checker
+
+            ### Установка
+            Скачай `checker.exe` и запусти — Python не нужен.
+
+            ### Использование
+            ```
+            checker.exe                        # интерактивный режим
+            checker.exe google.com github.com  # передать домены аргументами
+            ```
