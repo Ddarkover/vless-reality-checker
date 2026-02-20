@@ -33,25 +33,32 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Download openssl.exe для Windows
+      - name: Подготовить openssl.exe для упаковки
         shell: pwsh
         run: |
-          # Скачиваем статически слинкованный openssl.exe от FireDaemon (OpenSSL 3.x, без DLL-зависимостей)
-          $url = "https://mirror.firedaemon.com/OpenSSL/openssl-3.3.2.zip"
-          $zip = "openssl.zip"
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath openssl_dist -Force
-          # Ищем openssl.exe в распакованных файлах
-          $exe = Get-ChildItem -Recurse openssl_dist -Filter "openssl.exe" |
-                   Where-Object { $_.FullName -match "x64" } |
-                   Select-Object -First 1
-          if (-not $exe) {
-            $exe = Get-ChildItem -Recurse openssl_dist -Filter "openssl.exe" |
-                     Select-Object -First 1
+          # На windows-latest OpenSSL уже установлен — просто находим и копируем
+          $candidates = @(
+            "C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
+            "C:\Program Files\OpenSSL\bin\openssl.exe",
+            "C:\Program Files (x86)\OpenSSL-Win32\bin\openssl.exe"
+          )
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $found = $c; break }
           }
+          if (-not $found) {
+            # Ищем через where.exe
+            $found = (where.exe openssl 2>$null) | Select-Object -First 1
+          }
+          if (-not $found) {
+            Write-Error "openssl.exe не найден!"
+            exit 1
+          }
+          Write-Host "Найден: $found"
+          & $found version
           New-Item -ItemType Directory -Force -Path bin | Out-Null
-          Copy-Item $exe.FullName -Destination bin\openssl.exe
-          Write-Host "openssl.exe скопирован: $(bin\openssl.exe --version 2>&1)"
+          Copy-Item $found -Destination bin\openssl.exe
+          Write-Host "Скопирован в bin\openssl.exe"
 
       - name: Build EXE
         run: >
