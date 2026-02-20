@@ -9,6 +9,8 @@ import ssl
 import socket
 import math
 import ipaddress
+import subprocess
+import os
 from urllib.parse import urlparse
 
 import certifi
@@ -180,125 +182,72 @@ def check_redirect(domain: str) -> dict:
     return result
 
 
+def get_openssl_exe() -> str:
+    """
+    Возвращает путь к openssl.exe.
+    - В PyInstaller EXE: ищем в sys._MEIPASS/bin/
+    - При запуске из исходников: ищем bin/openssl.exe рядом со скриптом,
+      либо fallback на системный 'openssl' из PATH.
+    """
+    # PyInstaller распаковывает файлы в sys._MEIPASS
+    if hasattr(sys, "_MEIPASS"):
+        candidate = os.path.join(sys._MEIPASS, "bin", "openssl.exe")
+        if os.path.isfile(candidate):
+            return candidate
+
+    # Запуск из исходников — bin/ рядом с checker.py
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(script_dir, "bin", "openssl.exe")
+    if os.path.isfile(candidate):
+        return candidate
+
+    # Системный openssl (Linux / macOS / Windows с OpenSSL в PATH)
+    return "openssl"
+
+
 def check_ocsp(domain: str) -> dict:
     """
-    Критерий 6: OCSP Stapling.
-
-    Используем стандартный ssl модуль Python: делаем полный TLS handshake
-    с расширением status_request (через SSLContext), затем читаем staple
-    через внутренний _sslobj.  Это работает на Windows без pyOpenSSL.
+    Критерий 6: OCSP Stapling через openssl s_client -status.
+    openssl.exe упакован внутрь EXE через PyInstaller --add-binary.
     """
     result = {"ok": False, "error": None}
     try:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.minimum_version  = ssl.TLSVersion.TLSv1_2
-        ctx.load_verify_locations(cafile=certifi.where())
+        openssl = get_openssl_exe()
+        proc = subprocess.run(
+            [
+                openssl, "s_client",
+                "-connect", f"{domain}:443",
+                "-servername", domain,
+                "-status",          # запрашивает OCSP staple
+                "-brief",           # краткий вывод (меньше шума)
+                "-CAfile", certifi.where(),  # верификация через certifi
+            ],
+            input=b"Q\n",           # сразу закрываем соединение
+            capture_output=True,
+            timeout=20,
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW   # не открывать окно CMD на Windows
+                if sys.platform == "win32" else 0
+            ),
+        )
+        output = proc.stdout.decode(errors="ignore") + proc.stderr.decode(errors="ignore")
 
-        # Включаем запрос OCSP staple (status_request extension)
-        # Константа 6 = TLSEXT_STATUSTYPE_ocsp (определена в OpenSSL)
-        if hasattr(ctx, "set_tlsext_status_type"):          # Python >= 3.10
-            ctx.set_tlsext_status_type(1)                   # 1 = ocsp
+        if "OCSP Response Status: successful" in output:
+            result["ok"] = True
+        elif "No OCSP response" in output or "OCSP response: no response sent" in output:
+            result["ok"] = False
+        elif "connect: errno" in output or "Connection refused" in output:
+            result["error"] = "Соединение отклонено"
+        elif not output.strip():
+            result["error"] = "openssl не вернул данных"
+        # Иначе — просто не поддерживается, не ошибка
 
-        with socket.create_connection((domain, 443), timeout=10) as raw_sock:
-            with ctx.wrap_socket(raw_sock, server_hostname=domain) as ssock:
-                # Способ 1: через _sslobj (CPython 3.6+, работает на Windows)
-                inner = getattr(ssock, "_sslobj", None)
-                staple = None
-                if inner is not None:
-                    staple = getattr(inner, "get_tlsext_status_type", lambda: None)()
-                    # get_tlsext_status_type возвращает None или bytes
-                    if staple is None:
-                        # Пробуем альтернативный атрибут
-                        staple = getattr(inner, "_staple", None)
-
-                # Способ 2: пробуем получить через ctypes низкоуровнево
-                if not staple:
-                    staple = _get_ocsp_staple_ctypes(ssock)
-
-                result["ok"] = bool(staple)
-
-    except ssl.SSLCertVerificationError:
-        # Если сертификат не прошёл верификацию — делаем второй заход без неё,
-        # только для проверки OCSP staple
-        result = _check_ocsp_no_verify(domain)
-    except socket.timeout:
-        result["error"] = "Таймаут соединения"
-    except ConnectionRefusedError:
-        result["error"] = "Соединение отклонено"
+    except FileNotFoundError:
+        result["error"] = "openssl.exe не найден"
+    except subprocess.TimeoutExpired:
+        result["error"] = "Таймаут"
     except Exception as e:
-        result["error"] = str(e) or "Ошибка соединения"
-    return result
-
-
-def _get_ocsp_staple_ctypes(ssock: ssl.SSLSocket) -> bytes | None:
-    """
-    Низкоуровневое получение OCSP staple через ctypes + OpenSSL C API.
-    Работает на Windows и Linux с любым CPython.
-    """
-    try:
-        import ctypes
-        import ctypes.util
-
-        # Загружаем libssl
-        ssl_lib_name = ctypes.util.find_library("ssl")
-        if not ssl_lib_name:
-            # На Windows libssl может называться иначе
-            for name in ("libssl-3-x64.dll", "libssl-3.dll", "libssl-1_1-x64.dll", "libssl-1_1.dll"):
-                try:
-                    ssl_lib = ctypes.CDLL(name)
-                    break
-                except OSError:
-                    continue
-            else:
-                return None
-        else:
-            ssl_lib = ctypes.CDLL(ssl_lib_name)
-
-        # Получаем указатель на SSL* объект из ssock
-        # В CPython ssl.SSLObject хранит указатель в _sslobj
-        inner = getattr(ssock, "_sslobj", None)
-        if inner is None:
-            return None
-
-        # SSL_get_tlsext_status_ocsp_resp(ssl, resp) → длина данных
-        try:
-            ssl_lib.SSL_get_tlsext_status_ocsp_resp.restype  = ctypes.c_long
-            ssl_lib.SSL_get_tlsext_status_ocsp_resp.argtypes = [
-                ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)
-            ]
-            # Получить указатель ssl* через внутренний id
-            ssl_ptr = id(inner)   # не настоящий указатель — fallback не сработает
-            resp_ptr = ctypes.c_void_p(None)
-            length = ssl_lib.SSL_get_tlsext_status_ocsp_resp(ssl_ptr, ctypes.byref(resp_ptr))
-            if length > 0 and resp_ptr.value:
-                return ctypes.string_at(resp_ptr.value, length)
-        except Exception:
-            pass
-        return None
-    except Exception:
-        return None
-
-
-def _check_ocsp_no_verify(domain: str) -> dict:
-    """
-    Fallback: проверяем OCSP staple без верификации сертификата.
-    Используется когда certifi не знает CA (самоподписанные, корпоративные CA).
-    """
-    result = {"ok": False, "error": None}
-    try:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.minimum_version      = ssl.TLSVersion.TLSv1_2
-        ctx.check_hostname       = False
-        ctx.verify_mode          = ssl.CERT_NONE
-
-        with socket.create_connection((domain, 443), timeout=10) as raw_sock:
-            with ctx.wrap_socket(raw_sock, server_hostname=domain) as ssock:
-                staple = _get_ocsp_staple_ctypes(ssock)
-                result["ok"] = bool(staple)
-    except socket.timeout:
-        result["error"] = "Таймаут соединения"
-    except Exception as e:
-        result["error"] = str(e) or "Ошибка соединения"
+        result["error"] = str(e)
     return result
 
 
