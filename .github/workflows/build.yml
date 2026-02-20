@@ -33,6 +33,26 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Download openssl.exe для Windows
+        shell: pwsh
+        run: |
+          # Скачиваем статически слинкованный openssl.exe от FireDaemon (OpenSSL 3.x, без DLL-зависимостей)
+          $url = "https://mirror.firedaemon.com/OpenSSL/openssl-3.3.2.zip"
+          $zip = "openssl.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath openssl_dist -Force
+          # Ищем openssl.exe в распакованных файлах
+          $exe = Get-ChildItem -Recurse openssl_dist -Filter "openssl.exe" |
+                   Where-Object { $_.FullName -match "x64" } |
+                   Select-Object -First 1
+          if (-not $exe) {
+            $exe = Get-ChildItem -Recurse openssl_dist -Filter "openssl.exe" |
+                     Select-Object -First 1
+          }
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          Copy-Item $exe.FullName -Destination bin\openssl.exe
+          Write-Host "openssl.exe скопирован: $(bin\openssl.exe --version 2>&1)"
+
       - name: Build EXE
         run: >
           pyinstaller
@@ -41,6 +61,7 @@ jobs:
           --console
           --collect-all rich
           --collect-all certifi
+          --add-binary "bin/openssl.exe;bin"
           checker.py
 
       - name: Upload artifact (всегда)
