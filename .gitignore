@@ -1,0 +1,14 @@
+# PyInstaller
+dist/
+build/
+*.spec
+
+# OpenSSL бинарник (скачивается автоматически в CI)
+bin/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
