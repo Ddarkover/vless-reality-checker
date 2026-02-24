@@ -1,0 +1,83 @@
+name: Build Windows EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия релиза (например: v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write  # обязательно для создания Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE
+        run: >
+          pyinstaller
+          --onefile
+          --name checker
+          --console
+          --collect-all rich
+          --collect-all certifi
+          --collect-all cryptography
+          checker.py
+
+      - name: Upload artifact (всегда)
+        uses: actions/upload-artifact@v4
+        with:
+          name: checker-windows-exe
+          path: dist/checker.exe
+
+      # Определяем имя тега: либо из git-тега, либо из ввода workflow_dispatch
+      - name: Определить версию
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Создать GitHub Release и прикрепить EXE
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Release ${{ steps.version.outputs.tag }}"
+          draft: false
+          prerelease: false
+          files: dist/checker.exe
+          body: |
+            ## VLESS+Reality Camouflage Site Checker
+
+            ### Установка
+            Скачай `checker.exe` и запусти — Python не нужен.
+
+            ### Использование
+            ```
+            checker.exe                        # интерактивный режим
+            checker.exe google.com github.com  # передать домены аргументами
+            ```
