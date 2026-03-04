@@ -195,26 +195,280 @@ def check_redirect(domain: str) -> dict:
     return result
 
 
+# ──────────────────────────────────────────────────────────────────
+# OCSP Stapling — production реализация
+#
+# Метод A: сырой TLS handshake с расширением status_request (RFC 6066).
+#   Отправляем ClientHello вручную, читаем ответ побайтово, ищем
+#   handshake-сообщение CertificateStatus (тип 22 = 0x16).
+#   Именно так работают openssl s_client -status, sslyze, testssl.sh.
+#
+# Метод B: OCSP responder (RFC 6960) — fallback через cryptography.
+#   Если сервер не отдал staple в TLS — делаем HTTP POST к OCSP-серверу
+#   напрямую. Подтверждает что сертификат валиден, но stapling не активен.
+# ──────────────────────────────────────────────────────────────────
+
+def _build_tls12_client_hello(hostname: str) -> bytes:
+    """
+    Строит минимальный TLS 1.2 ClientHello с расширением status_request.
+    Сервер обязан ответить CertificateStatus если поддерживает stapling.
+    Используем TLS 1.2 а не 1.3: в TLS 1.3 Certificate зашифрован,
+    поэтому staple читается иначе — через EncryptedExtensions, что
+    требует полного handshake. TLS 1.2 проще парсить на уровне сырых байт.
+    """
+    import os
+    import struct
+
+    # Random (32 bytes)
+    client_random = os.urandom(32)
+
+    # Session ID — пустой
+    session_id = b"\x00"
+
+    # Cipher suites: несколько распространённых + SCSV
+    cipher_suites = bytes([
+        0x00, 0x1c,              # длина: 14 байт
+        0xc0, 0x2b,              # TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        0xc0, 0x2f,              # TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        0xc0, 0x2c,              # TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        0xc0, 0x30,              # TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        0x00, 0x9c,              # TLS_RSA_WITH_AES_128_GCM_SHA256
+        0x00, 0xff,              # TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+    ])
+
+    # Compression methods: null only
+    compression = b"\x01\x00"
+
+    # ── Расширения ──
+
+    # server_name (SNI)
+    sni_name    = hostname.encode("ascii")
+    sni_ext     = (
+        b"\x00\x00"                                    # type: server_name
+        + struct.pack(">H", len(sni_name) + 5)         # ext length
+        + struct.pack(">H", len(sni_name) + 3)         # list length
+        + b"\x00"                                      # name type: host_name
+        + struct.pack(">H", len(sni_name))             # name length
+        + sni_name
+    )
+
+    # status_request (OCSP) — RFC 6066 §8
+    # Просим сервер прикрепить OCSP staple к Certificate
+    status_request_ext = bytes([
+        0x00, 0x12,              # type: status_request (18)
+        0x00, 0x05,              # length: 5
+        0x01,                    # status type: ocsp (1)
+        0x00, 0x00,              # responder ID list: empty
+        0x00, 0x00,              # request extensions: empty
+    ])
+
+    # supported_groups (elliptic_curves)
+    supported_groups_ext = bytes([
+        0x00, 0x0a,              # type: supported_groups
+        0x00, 0x08,              # length: 8
+        0x00, 0x06,              # list length: 6
+        0x00, 0x1d,              # x25519
+        0x00, 0x17,              # secp256r1
+        0x00, 0x18,              # secp384r1
+    ])
+
+    # ec_point_formats
+    ec_point_ext = bytes([
+        0x00, 0x0b,              # type: ec_point_formats
+        0x00, 0x02,              # length: 2
+        0x01,                    # list length: 1
+        0x00,                    # uncompressed
+    ])
+
+    # signature_algorithms
+    sig_algs_ext = bytes([
+        0x00, 0x0d,              # type: signature_algorithms
+        0x00, 0x0c,              # length: 12
+        0x00, 0x0a,              # list length: 10
+        0x04, 0x01,              # rsa_pkcs1_sha256
+        0x04, 0x03,              # ecdsa_secp256r1_sha256
+        0x05, 0x01,              # rsa_pkcs1_sha384
+        0x06, 0x01,              # rsa_pkcs1_sha512
+        0x02, 0x01,              # rsa_pkcs1_sha1
+    ])
+
+    extensions = sni_ext + status_request_ext + supported_groups_ext + ec_point_ext + sig_algs_ext
+
+    # ── Собираем ClientHello ──
+    hello_body = (
+        b"\x03\x03"              # client_version: TLS 1.2
+        + client_random
+        + session_id
+        + cipher_suites
+        + compression
+        + struct.pack(">H", len(extensions))
+        + extensions
+    )
+
+    # Handshake header: type=1 (ClientHello) + 3-byte length
+    handshake = (
+        b"\x01"
+        + struct.pack(">I", len(hello_body))[1:]       # 3 bytes
+        + hello_body
+    )
+
+    # TLS Record: content_type=22 (handshake), version=TLS 1.0, length
+    record = (
+        b"\x16\x03\x01"
+        + struct.pack(">H", len(handshake))
+        + handshake
+    )
+    return record
+
+
+def _tls_has_ocsp_staple(domain: str, timeout: int = 10) -> bool | None:
+    """
+    Отправляет raw ClientHello с status_request и проверяет наличие
+    CertificateStatus в ответе сервера.
+
+    Возвращает:
+      True  — сервер прислал OCSP staple в handshake
+      False — сервер не прислал staple (stapling не настроен)
+      None  — ошибка соединения / таймаут
+    """
+    import struct
+
+    try:
+        with socket.create_connection((domain, 443), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(_build_tls12_client_hello(domain))
+
+            # Читаем ответ — нас интересуют TLS records
+            # CertificateStatus — handshake type 22 (0x16)
+            # Обычно приходит в одном из первых records после ServerHello
+            buf = b""
+            deadline = 8  # секунд на чтение
+
+            import time
+            t0 = time.monotonic()
+
+            while time.monotonic() - t0 < deadline:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+
+                # Ищем CertificateStatus message в буфере
+                # TLS record: [content_type(1)][version(2)][length(2)][data]
+                # Handshake msg: [type(1)][length(3)][data]
+                # CertificateStatus: handshake type = 22 (0x16)
+                pos = 0
+                while pos + 5 <= len(buf):
+                    content_type = buf[pos]
+                    rec_len      = struct.unpack(">H", buf[pos + 3: pos + 5])[0]
+
+                    if pos + 5 + rec_len > len(buf):
+                        break  # record ещё не полностью получен
+
+                    record_data = buf[pos + 5: pos + 5 + rec_len]
+
+                    if content_type == 0x15:  # Alert — сервер отклонил
+                        return None
+
+                    if content_type == 0x16:  # Handshake record
+                        # Проходим по handshake-сообщениям внутри record
+                        hpos = 0
+                        while hpos + 4 <= len(record_data):
+                            htype  = record_data[hpos]
+                            hlen   = struct.unpack(">I", b"\x00" + record_data[hpos + 1: hpos + 4])[0]
+
+                            if htype == 0x16:  # CertificateStatus (22)
+                                # Сервер прислал OCSP staple!
+                                return True
+
+                            if htype == 0x0b:  # Certificate — значит ServerHello уже прошёл,
+                                # но CertificateStatus не было → stapling не поддерживается
+                                return False
+
+                            hpos += 4 + hlen
+
+                    pos += 5 + rec_len
+
+                # Если уже видели Certificate и не было staple — выходим
+                if b"\x0b" in buf[5:]:  # быстрая эвристика
+                    # Проверяем точнее через повторный разбор
+                    found_cert       = False
+                    found_staple     = False
+                    pos2 = 0
+                    while pos2 + 5 <= len(buf):
+                        ct   = buf[pos2]
+                        rlen = struct.unpack(">H", buf[pos2 + 3: pos2 + 5])[0]
+                        if pos2 + 5 + rlen > len(buf):
+                            break
+                        rdata = buf[pos2 + 5: pos2 + 5 + rlen]
+                        if ct == 0x16:
+                            hpos = 0
+                            while hpos + 4 <= len(rdata):
+                                ht   = rdata[hpos]
+                                hlen = struct.unpack(">I", b"\x00" + rdata[hpos + 1: hpos + 4])[0]
+                                if ht == 0x16:
+                                    found_staple = True
+                                if ht == 0x0b:
+                                    found_cert = True
+                                hpos += 4 + hlen
+                        pos2 += 5 + rlen
+                    if found_cert:
+                        return found_staple
+
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return None
+    except Exception:
+        return None
+
+    return None
+
+
 def check_ocsp(domain: str) -> dict:
     """
     Критерий 6: OCSP Stapling.
 
-    Общепринятый метод: получаем сертификат сервера → извлекаем URL OCSP-сервера
-    из расширения Authority Information Access → делаем HTTP POST к OCSP-серверу
-    → проверяем статус сертификата.
+    Production-метод (два канала):
 
-    Это стандартный способ, используемый в ssllabs, testssl.sh и других инструментах.
-    Не требует openssl.exe.
+    [A] Сырой TLS handshake с status_request extension (RFC 6066):
+        Отправляем ClientHello вручную, парсим ответ побайтово.
+        Ищем CertificateStatus handshake message (тип 22 / 0x16).
+        Это единственный способ проверить именно OCSP STAPLING —
+        то есть отдаёт ли сервер staple В TLS HANDSHAKE клиенту.
+        Так работают: openssl s_client -status, sslyze, testssl.sh.
+
+    [B] OCSP responder HTTP POST (RFC 6960) — fallback и доп. валидация:
+        Если метод A вернул False или None — проверяем что OCSP
+        responder доступен и сертификат не отозван.
+        Это подтверждает что CA и цепочка валидны, но означает что
+        stapling на сервере НЕ настроен.
     """
-    result = {"ok": False, "error": None}
+    result = {
+        "ok":        False,
+        "stapled":   False,   # staple получен в TLS handshake
+        "ocsp_ok":   False,   # OCSP responder подтвердил валидность
+        "error":     None,
+    }
+
+    # ── Метод A: сырой TLS + status_request ──
+    stapled = _tls_has_ocsp_staple(domain)
+
+    if stapled is True:
+        result["ok"]      = True
+        result["stapled"] = True
+        result["ocsp_ok"] = True
+        return result
+
+    # ── Метод B: OCSP responder напрямую ──
     try:
         from cryptography import x509
         from cryptography.hazmat.primitives import serialization, hashes
         from cryptography.x509 import ocsp as crypto_ocsp
         from cryptography.x509.oid import ExtensionOID, AuthorityInformationAccessOID
-        import base64
 
-        # ── Шаг 1: получаем сертификат сервера через TLS ──
+        # Получаем сертификат сервера
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(cafile=certifi.where())
         ctx.check_hostname = True
@@ -224,42 +478,28 @@ def check_ocsp(domain: str) -> dict:
             with ctx.wrap_socket(raw_sock, server_hostname=domain) as ssock:
                 cert_der = ssock.getpeercert(binary_form=True)
 
-        if not cert_der:
-            result["error"] = "Не удалось получить сертификат"
-            return result
-
-        # ── Шаг 2: парсим сертификат ──
         cert = x509.load_der_x509_certificate(cert_der)
 
-        # ── Шаг 3: извлекаем OCSP URL и caIssuers из AIA ──
+        # AIA → OCSP URL + caIssuers
         try:
             aia = cert.extensions.get_extension_for_oid(
                 ExtensionOID.AUTHORITY_INFORMATION_ACCESS
             ).value
         except x509.ExtensionNotFound:
-            result["error"] = "Сертификат не содержит AIA (OCSP URL отсутствует)"
+            # Нет AIA — нельзя проверить ни stapling, ни OCSP
+            result["error"] = "Сертификат не содержит AIA"
             return result
 
-        ocsp_urls = [
-            desc.access_location.value
-            for desc in aia
-            if desc.access_method == AuthorityInformationAccessOID.OCSP
-        ]
-        ca_urls = [
-            desc.access_location.value
-            for desc in aia
-            if desc.access_method == AuthorityInformationAccessOID.CA_ISSUERS
-        ]
+        ocsp_urls = [d.access_location.value for d in aia
+                     if d.access_method == AuthorityInformationAccessOID.OCSP]
+        ca_urls   = [d.access_location.value for d in aia
+                     if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS]
 
         if not ocsp_urls:
-            result["error"] = "OCSP URL не найден в сертификате"
+            result["error"] = "OCSP URL отсутствует в сертификате"
             return result
 
-        ocsp_url = ocsp_urls[0]
-
-        # ── Шаг 4: получаем issuer сертификат по caIssuers URL ──
-        # Надёжный способ для Python 3.10-3.12 (get_verified_chain нет до 3.13):
-        # скачиваем issuer напрямую по URL из AIA (стандарт RFC 5280)
+        # Скачиваем issuer сертификат
         issuer_cert = None
         for ca_url in ca_urls:
             try:
@@ -276,40 +516,38 @@ def check_ocsp(domain: str) -> dict:
                 continue
 
         if issuer_cert is None:
-            result["error"] = "Не удалось скачать issuer-сертификат (caIssuers)"
+            result["error"] = "Не удалось получить issuer-сертификат"
             return result
 
-        # ── Шаг 5: строим OCSP Request и отправляем ──
-        builder = crypto_ocsp.OCSPRequestBuilder()
-        builder = builder.add_certificate(cert, issuer_cert, hashes.SHA1())
+        # Строим и отправляем OCSP запрос
+        builder  = crypto_ocsp.OCSPRequestBuilder()
+        builder  = builder.add_certificate(cert, issuer_cert, hashes.SHA1())
         ocsp_req = builder.build()
-        ocsp_req_data = ocsp_req.public_bytes(serialization.Encoding.DER)
 
         with httpx.Client(timeout=10, verify=certifi.where()) as client:
             resp = client.post(
-                ocsp_url,
-                content=ocsp_req_data,
+                ocsp_urls[0],
+                content=ocsp_req.public_bytes(serialization.Encoding.DER),
                 headers={"Content-Type": "application/ocsp-request"},
                 follow_redirects=True,
             )
 
         if resp.status_code != 200:
-            result["error"] = f"OCSP сервер вернул HTTP {resp.status_code}"
+            result["error"] = f"OCSP сервер: HTTP {resp.status_code}"
             return result
 
-        # ── Шаг 6: парсим OCSP Response ──
         ocsp_resp = crypto_ocsp.load_der_ocsp_response(resp.content)
 
         if ocsp_resp.response_status == crypto_ocsp.OCSPResponseStatus.SUCCESSFUL:
             cert_status = ocsp_resp.certificate_status
             if cert_status == crypto_ocsp.OCSPCertStatus.GOOD:
-                result["ok"]    = True
+                # OCSP responder говорит "хорошо", но staple не в handshake
+                result["ocsp_ok"] = True
+                result["ok"]      = False   # stapling НЕ настроен на сервере
             elif cert_status == crypto_ocsp.OCSPCertStatus.REVOKED:
-                result["ok"]    = False
-                result["error"] = "Сертификат отозван (REVOKED)"
+                result["error"]   = "Сертификат отозван (REVOKED)"
             else:
-                result["ok"]    = False
-                result["error"] = "OCSP: статус UNKNOWN"
+                result["error"]   = "OCSP статус: UNKNOWN"
         else:
             result["error"] = f"OCSP ответ: {ocsp_resp.response_status.name}"
 
@@ -317,12 +555,11 @@ def check_ocsp(domain: str) -> dict:
         result["error"] = f"Ошибка верификации сертификата: {e.reason}"
     except socket.timeout:
         result["error"] = "Таймаут соединения"
-    except ConnectionRefusedError:
-        result["error"] = "Соединение отклонено"
     except ImportError:
-        result["error"] = "Не установлена библиотека cryptography"
+        result["error"] = "Пакет cryptography не установлен"
     except Exception as e:
-        result["error"] = str(e) or "Неизвестная ошибка"
+        result["error"] = _clean_error(str(e))
+
     return result
 
 
@@ -594,9 +831,15 @@ def render_results(data: dict):
     if ocsp.get("error"):
         ocsp_icon   = ok_icon(False)
         ocsp_detail = f"[red]Ошибка: {ocsp['error']}[/red]"
+    elif ocsp.get("stapled"):
+        ocsp_icon   = ok_icon(True)
+        ocsp_detail = "Stapling активен  [dim](staple получен в TLS handshake)[/dim]"
+    elif ocsp.get("ocsp_ok"):
+        ocsp_icon   = ok_icon(False)
+        ocsp_detail = "[yellow]Stapling не настроен  [dim](OCSP responder доступен, сертификат валиден)[/dim][/yellow]"
     else:
-        ocsp_icon   = ok_icon(ocsp["ok"])
-        ocsp_detail = "Stapling активен" if ocsp["ok"] else "Не поддерживается"
+        ocsp_icon   = ok_icon(False)
+        ocsp_detail = "Не поддерживается"
     table.add_row(ocsp_icon, "[6] OCSP Stapling", ocsp_detail)
 
     console.print(Panel(table, title=title, border_style=score_color, padding=(0, 1)))
